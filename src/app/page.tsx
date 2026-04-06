@@ -111,12 +111,39 @@ async function sha256Hex(file: File) {
 }
 
 async function extractPdfText(file: File) {
+  type PdfTextItem = { str?: unknown };
+  type PdfPage = { getTextContent: () => Promise<{ items: PdfTextItem[] }> };
+  type PdfDoc = { numPages: number; getPage: (n: number) => Promise<PdfPage> };
+
   const buf = await file.arrayBuffer();
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
+  const pdfjsAny = pdfjs as unknown as {
+    version?: string;
+    GlobalWorkerOptions?: { workerSrc?: string };
+    getDocument: (p: unknown) => { promise: Promise<PdfDoc> };
+  };
 
-  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf) });
-  const pdf = await loadingTask.promise;
+  const data = new Uint8Array(buf);
+
+  const load = async (opts: unknown) => {
+    const loadingTask = pdfjsAny.getDocument(opts);
+    return loadingTask.promise;
+  };
+
+  let pdf: PdfDoc;
+  try {
+    pdf = await load({ data, disableWorker: true });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('GlobalWorkerOptions.workerSrc')) {
+      if (pdfjsAny.GlobalWorkerOptions && !pdfjsAny.GlobalWorkerOptions.workerSrc && pdfjsAny.version) {
+        pdfjsAny.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsAny.version}/pdf.worker.min.js`;
+      }
+      pdf = await load({ data });
+    } else {
+      throw e;
+    }
+  }
 
   const parts: string[] = [];
   const maxPages = Math.min(pdf.numPages, 20);
@@ -125,7 +152,7 @@ async function extractPdfText(file: File) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
     const strings = content.items
-      .map((it) => (typeof (it as { str?: unknown }).str === "string" ? (it as { str: string }).str : ""))
+      .map((it) => (typeof it.str === "string" ? it.str : ""))
       .filter(Boolean);
     if (strings.length) parts.push(strings.join(" "));
   }
@@ -251,15 +278,25 @@ export default function Home() {
     streamingTimerRef.current = null;
   }
 
+  function onResumeFileSelected(file: File | null) {
+    setResumeFile(file);
+    setResumeJson(null);
+    setResumeText("");
+    setResumeHash(null);
+    setResumeCacheHit(false);
+    if (file) void parseResume(file);
+  }
+
   async function parseResume(file: File) {
     setErrorText(null);
     setPhase("parsing");
-    const hash = await sha256Hex(file);
-    setResumeHash(hash);
+    const hash = await sha256Hex(file).catch(() => null);
+    const effectiveHash = hash ?? `${file.name}:${file.size}:${file.lastModified}`;
+    setResumeHash(hash ?? null);
 
     const cachedRaw = (() => {
       try {
-        return window.localStorage.getItem(resumeCacheKey(hash));
+        return window.localStorage.getItem(resumeCacheKey(effectiveHash));
       } catch {
         return null;
       }
@@ -274,34 +311,56 @@ export default function Home() {
         return cached;
       } catch {
         try {
-          window.localStorage.removeItem(resumeCacheKey(hash));
+          window.localStorage.removeItem(resumeCacheKey(effectiveHash));
         } catch {}
       }
     }
 
     const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
     let resp: Response;
-    const form = new FormData();
-    form.append("resume", file);
-    resp = await fetch("/api/parse-resume", { method: "POST", body: form });
+    let extractedText = "";
 
-    if (isPdf && !resp.ok && resp.status !== 429) {
+    if (isPdf) {
       try {
-        const resumeText = await extractPdfText(file);
-        if (resumeText) {
-          setResumeText(resumeText);
+        const t = await extractPdfText(file);
+        if (t) {
+          extractedText = t;
+          setResumeText(t);
+        }
+        if (t && t.length >= 80) {
           resp = await fetch("/api/parse-resume", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ resumeText }),
+            body: JSON.stringify({ resumeText: t }),
           });
+        } else {
+          const form = new FormData();
+          form.append("resume", file);
+          resp = await fetch("/api/parse-resume", { method: "POST", body: form });
         }
-      } catch {}
-    } else if (isPdf) {
+      } catch (e) {
+        setErrorText(e instanceof Error ? e.message : "上传失败");
+        setPhase("idle");
+        return null;
+      }
+    } else {
+      const form = new FormData();
+      form.append("resume", file);
       try {
-        const t = await extractPdfText(file);
-        if (t) setResumeText(t);
-      } catch {}
+        resp = await fetch("/api/parse-resume", { method: "POST", body: form });
+      } catch (e) {
+        setErrorText(e instanceof Error ? e.message : "上传失败");
+        setPhase("idle");
+        return null;
+      }
+    }
+
+    if (isPdf && !resp.ok && resp.status !== 429 && extractedText.trim()) {
+      resp = await fetch("/api/parse-resume", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ resumeText: extractedText.trim() }),
+      });
     }
 
     if (resp.status === 429) {
@@ -324,7 +383,7 @@ export default function Home() {
     setResumeJson(data.data);
     setResumeCacheHit(false);
     try {
-      window.localStorage.setItem(resumeCacheKey(hash), JSON.stringify(data.data));
+      window.localStorage.setItem(resumeCacheKey(effectiveHash), JSON.stringify(data.data));
     } catch {}
     setPhase("idle");
     return data.data;
@@ -484,17 +543,40 @@ export default function Home() {
                   <input
                     type="file"
                     className="sr-only"
-                    accept="application/pdf,image/*"
+                    accept="application/pdf,.pdf,image/*"
                     onChange={(e) => {
                       const file = e.target.files?.[0] ?? null;
-                      setResumeFile(file);
-                      setResumeJson(null);
-                      setResumeHash(null);
-                      setResumeCacheHit(false);
-                      if (file) void parseResume(file);
+                      onResumeFileSelected(file);
                     }}
                   />
                 </label>
+
+                <div className="flex flex-wrap gap-2">
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-900 shadow-sm transition hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900">
+                    仅选 PDF
+                    <input
+                      type="file"
+                      className="sr-only"
+                      accept="application/pdf,.pdf"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0] ?? null;
+                        onResumeFileSelected(file);
+                      }}
+                    />
+                  </label>
+                  <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-900 shadow-sm transition hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:hover:bg-zinc-900">
+                    仅选图片
+                    <input
+                      type="file"
+                      className="sr-only"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0] ?? null;
+                        onResumeFileSelected(file);
+                      }}
+                    />
+                  </label>
+                </div>
               </div>
 
               <div className="space-y-2">

@@ -15,6 +15,38 @@ type OpenAIMessage =
       >;
     };
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function tryExtractOpenRouterErrorMessage(text: string) {
+  const raw = text.trim();
+  if (!raw) return null;
+  try {
+    const json = JSON.parse(raw) as {
+      error?: { message?: unknown; code?: unknown };
+      message?: unknown;
+    };
+    const message =
+      (typeof json?.error?.message === "string" && json.error.message.trim()) ||
+      (typeof json?.message === "string" && json.message.trim()) ||
+      null;
+    if (!message) return null;
+    const code = typeof json?.error?.code === "string" ? json.error.code : typeof json?.error?.code === "number" ? String(json.error.code) : null;
+    return code ? `${message}（${code}）` : message;
+  } catch {
+    return null;
+  }
+}
+
+async function toFriendlyUpstreamErrorText(resp: Response) {
+  const t = await resp.text().catch(() => "");
+  const extracted = tryExtractOpenRouterErrorMessage(t);
+  const pretty = extracted ?? t.trim();
+  if (!pretty) return "";
+  return pretty.length > 240 ? `${pretty.slice(0, 240)}…` : pretty;
+}
+
 function requiredHeaders() {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("缺少 OPENROUTER_API_KEY");
@@ -44,14 +76,60 @@ async function openrouterFetch(path: string, init: RequestInit) {
 
 function tryParseJson(text: string) {
   const trimmed = text.trim();
+  const unfenced = (() => {
+    const s = trimmed;
+    const m = s.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (m && typeof m[1] === "string") return m[1].trim();
+    if (s.startsWith("```") && s.endsWith("```")) return s.slice(3, -3).trim();
+    return s;
+  })();
   try {
-    return JSON.parse(trimmed);
+    return JSON.parse(unfenced);
   } catch {
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
+    const objStart = unfenced.indexOf("{");
+    const objEnd = unfenced.lastIndexOf("}");
+    if (objStart >= 0 && objEnd > objStart) return JSON.parse(unfenced.slice(objStart, objEnd + 1));
+    const arrStart = unfenced.indexOf("[");
+    const arrEnd = unfenced.lastIndexOf("]");
+    if (arrStart >= 0 && arrEnd > arrStart) return JSON.parse(unfenced.slice(arrStart, arrEnd + 1));
     throw new Error("模型返回内容不是有效 JSON");
   }
+}
+
+async function coerceToJsonObject(params: {
+  badText: string;
+  schema: string;
+  model: string;
+}) {
+  const system = [
+    "你是 JSON 修复器。",
+    "你会收到一段可能包含自然语言/Markdown/不完整 JSON 的文本。",
+    "请将其转换为严格 JSON，并且严格符合给定 Schema。",
+    "只输出 JSON，不要输出任何解释、Markdown 或代码块。",
+    "",
+    "Schema：",
+    params.schema,
+  ].join("\n");
+
+  const user = [
+    "待修复文本：",
+    params.badText,
+    "",
+    "请输出严格 JSON：",
+  ].join("\n");
+
+  const text = await chatCompletion({
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    model: params.model,
+    temperature: 0,
+    maxTokens: 700,
+    responseJson: true,
+  });
+
+  return tryParseJson(text);
 }
 
 export async function chatCompletion(params: {
@@ -62,26 +140,31 @@ export async function chatCompletion(params: {
   responseJson?: boolean;
   plugins?: unknown[];
 }) {
-  const resp = await openrouterFetch("/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: params.model ?? OPENROUTER_GREETING_MODEL,
-      messages: params.messages,
-      temperature: params.temperature ?? 0.2,
-      max_tokens: params.maxTokens ?? 800,
-      ...(params.responseJson ? { response_format: { type: "json_object" } } : {}),
-      ...(params.plugins ? { plugins: params.plugins } : {}),
-      stream: false,
-    }),
-  });
+  const makeReq = () =>
+    openrouterFetch("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: params.model ?? OPENROUTER_GREETING_MODEL,
+        messages: params.messages,
+        temperature: params.temperature ?? 0.2,
+        max_tokens: params.maxTokens ?? 800,
+        ...(params.responseJson ? { response_format: { type: "json_object" } } : {}),
+        ...(params.plugins ? { plugins: params.plugins } : {}),
+        stream: false,
+      }),
+    });
 
+  let resp = await makeReq();
   if (resp.status === 429) {
-    throw Object.assign(new Error("免费通道繁忙，请 5 秒后重试"), { status: 429 });
+    await sleep(900);
+    resp = await makeReq();
   }
 
+  if (resp.status === 429) throw Object.assign(new Error("免费通道繁忙，请 5 秒后重试"), { status: 429 });
+
   if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
+    const t = await toFriendlyUpstreamErrorText(resp);
     throw Object.assign(
       new Error(`OpenRouter 请求失败：${resp.status} ${resp.statusText}${t ? ` - ${t}` : ""}`),
       { status: resp.status },
@@ -131,21 +214,48 @@ export async function parseResumeFromText(params: { resumeText: string }) {
     responseJson: true,
   });
 
-  const parsed = tryParseJson(text) as Partial<{
-    coreSkills: unknown;
-    projectExperienceSummary: unknown;
-    keyAchievements: unknown;
-    yearsOfExperience: unknown;
-  }>;
+  const schema = [
+    "{",
+    '  "coreSkills": string[],',
+    '  "projectExperienceSummary": string,',
+    '  "keyAchievements": string[],',
+    '  "yearsOfExperience": number | null',
+    "}",
+  ].join("\n");
+
+  const parsed = (() => {
+    try {
+      return tryParseJson(text) as Partial<{
+        coreSkills: unknown;
+        projectExperienceSummary: unknown;
+        keyAchievements: unknown;
+        yearsOfExperience: unknown;
+      }>;
+    } catch {
+      return null;
+    }
+  })();
+
+  const repaired = parsed ??
+    (await coerceToJsonObject({
+      badText: text,
+      schema,
+      model: OPENROUTER_RESUME_MODEL,
+    })) as Partial<{
+      coreSkills: unknown;
+      projectExperienceSummary: unknown;
+      keyAchievements: unknown;
+      yearsOfExperience: unknown;
+    }>;
 
   return {
-    coreSkills: Array.isArray(parsed.coreSkills) ? parsed.coreSkills.filter((s) => typeof s === "string") : [],
+    coreSkills: Array.isArray(repaired.coreSkills) ? repaired.coreSkills.filter((s) => typeof s === "string") : [],
     projectExperienceSummary:
-      typeof parsed.projectExperienceSummary === "string" ? parsed.projectExperienceSummary : "",
-    keyAchievements: Array.isArray(parsed.keyAchievements)
-      ? parsed.keyAchievements.filter((s) => typeof s === "string")
+      typeof repaired.projectExperienceSummary === "string" ? repaired.projectExperienceSummary : "",
+    keyAchievements: Array.isArray(repaired.keyAchievements)
+      ? repaired.keyAchievements.filter((s) => typeof s === "string")
       : [],
-    yearsOfExperience: typeof parsed.yearsOfExperience === "number" ? parsed.yearsOfExperience : null,
+    yearsOfExperience: typeof repaired.yearsOfExperience === "number" ? repaired.yearsOfExperience : null,
   };
 }
 
@@ -194,21 +304,48 @@ export async function parseResumeMultimodal(params: {
     plugins: isPdf ? [{ id: "file-parser", pdf: { engine: "cloudflare-ai" } }] : undefined,
   });
 
-  const parsed = tryParseJson(text) as Partial<{
-    coreSkills: unknown;
-    projectExperienceSummary: unknown;
-    keyAchievements: unknown;
-    yearsOfExperience: unknown;
-  }>;
+  const schema = [
+    "{",
+    '  "coreSkills": string[],',
+    '  "projectExperienceSummary": string,',
+    '  "keyAchievements": string[],',
+    '  "yearsOfExperience": number | null',
+    "}",
+  ].join("\n");
+
+  const parsed = (() => {
+    try {
+      return tryParseJson(text) as Partial<{
+        coreSkills: unknown;
+        projectExperienceSummary: unknown;
+        keyAchievements: unknown;
+        yearsOfExperience: unknown;
+      }>;
+    } catch {
+      return null;
+    }
+  })();
+
+  const repaired = parsed ??
+    (await coerceToJsonObject({
+      badText: text,
+      schema,
+      model: OPENROUTER_RESUME_MODEL,
+    })) as Partial<{
+      coreSkills: unknown;
+      projectExperienceSummary: unknown;
+      keyAchievements: unknown;
+      yearsOfExperience: unknown;
+    }>;
 
   return {
-    coreSkills: Array.isArray(parsed.coreSkills) ? parsed.coreSkills.filter((s) => typeof s === "string") : [],
+    coreSkills: Array.isArray(repaired.coreSkills) ? repaired.coreSkills.filter((s) => typeof s === "string") : [],
     projectExperienceSummary:
-      typeof parsed.projectExperienceSummary === "string" ? parsed.projectExperienceSummary : "",
-    keyAchievements: Array.isArray(parsed.keyAchievements)
-      ? parsed.keyAchievements.filter((s) => typeof s === "string")
+      typeof repaired.projectExperienceSummary === "string" ? repaired.projectExperienceSummary : "",
+    keyAchievements: Array.isArray(repaired.keyAchievements)
+      ? repaired.keyAchievements.filter((s) => typeof s === "string")
       : [],
-    yearsOfExperience: typeof parsed.yearsOfExperience === "number" ? parsed.yearsOfExperience : null,
+    yearsOfExperience: typeof repaired.yearsOfExperience === "number" ? repaired.yearsOfExperience : null,
   };
 }
 
@@ -262,31 +399,39 @@ export async function streamGreetingText(params: {
   user: string;
   model?: string;
 }) {
-  const resp = await openrouterFetch("/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "text/event-stream",
-    },
-    body: JSON.stringify({
-      model: params.model ?? OPENROUTER_GREETING_MODEL,
-      stream: true,
-      temperature: 0.6,
-      max_tokens: 400,
-      messages: [
-        { role: "system", content: params.system },
-        { role: "user", content: params.user },
-      ],
-    }),
-  });
+  const makeReq = () =>
+    openrouterFetch("/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify({
+        model: params.model ?? OPENROUTER_GREETING_MODEL,
+        stream: true,
+        temperature: 0.6,
+        max_tokens: 400,
+        messages: [
+          { role: "system", content: params.system },
+          { role: "user", content: params.user },
+        ],
+      }),
+    });
 
+  let resp = await makeReq();
   if (resp.status === 429) {
-    throw Object.assign(new Error("免费通道繁忙，请 5 秒后重试"), { status: 429 });
+    await sleep(900);
+    resp = await makeReq();
   }
 
+  if (resp.status === 429) throw Object.assign(new Error("免费通道繁忙，请 5 秒后重试"), { status: 429 });
+
   if (!resp.ok || !resp.body) {
-    const t = await resp.text().catch(() => "");
-    throw new Error(`OpenRouter 流式请求失败：${resp.status} ${resp.statusText}${t ? ` - ${t}` : ""}`);
+    const t = await toFriendlyUpstreamErrorText(resp);
+    throw Object.assign(
+      new Error(`OpenRouter 流式请求失败：${resp.status} ${resp.statusText}${t ? ` - ${t}` : ""}`),
+      { status: resp.status },
+    );
   }
 
   const upstream = resp.body;
