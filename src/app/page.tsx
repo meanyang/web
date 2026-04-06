@@ -130,15 +130,19 @@ async function extractPdfText(file: File) {
     return loadingTask.promise;
   };
 
+  if (pdfjsAny.GlobalWorkerOptions && !pdfjsAny.GlobalWorkerOptions.workerSrc) {
+    pdfjsAny.GlobalWorkerOptions.workerSrc = new URL(
+      "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
+      import.meta.url,
+    ).toString();
+  }
+
   let pdf: PdfDoc;
   try {
     pdf = await load({ data, disableWorker: true });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes('GlobalWorkerOptions.workerSrc')) {
-      if (pdfjsAny.GlobalWorkerOptions && !pdfjsAny.GlobalWorkerOptions.workerSrc && pdfjsAny.version) {
-        pdfjsAny.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsAny.version}/pdf.worker.min.js`;
-      }
       pdf = await load({ data });
     } else {
       throw e;
